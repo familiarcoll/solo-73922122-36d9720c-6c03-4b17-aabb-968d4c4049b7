@@ -19,6 +19,9 @@ PORT2="${PORT2:-$((PORT+1))}"
 BASE="http://127.0.0.1:$PORT"
 LOG="$BASE_DIR/server.log"
 PY="${PYTHON:-python3}"
+# 无论从哪个目录调用，都切到仓库根目录，保证 uvicorn 能导入 app 包
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
 
 mkdir -p "$DATA_DIR" "$BASE_DIR/samples"
 trap 'echo; echo "演示数据保留在: $BASE_DIR（可手动删除）"' EXIT
@@ -184,6 +187,62 @@ for f in img-a img-b; do
   cmp "$BASE_DIR/samples/$f.tif" "$BASE_DIR/samples/$f.restart-dl.tif"
 done
 ok "重启后全部已归档文件仍可解密，且与原件逐字节一致"
+
+say "4/ 同视野比对（内存解密；容忍亮度变化与水平/垂直各 ≤8px 平移）"
+mk_tiff() { "$PY" "$ROOT/scripts/make_sample_tiff.py" "$@"; }
+
+# 4.1 同视野：同一张纹理，B 相对 A 有 (dy=5, dx=-6) 的画面平移
+mk_tiff "$BASE_DIR/samples/fov-a.tif" --size 96 --seed 42
+mk_tiff "$BASE_DIR/samples/fov-b.tif" --size 96 --seed 42 --shift 5 -6
+# 4.2 同视野 + 整体亮度变化（增益 0.6、偏置 60）
+mk_tiff "$BASE_DIR/samples/fov-bright.tif" --size 96 --seed 42 --brightness 0.6 60
+# 4.3 不同视野：另一组随机纹理
+mk_tiff "$BASE_DIR/samples/fov-other.tif" --size 96 --seed 77
+# 4.4 不支持的影像：压缩标签（服务端给出拒绝原因，不参与比对）
+mk_tiff "$BASE_DIR/samples/fov-lzw.tif" --size 96 --seed 42 --compressed
+
+FA="$(upload "$BASE_DIR/samples/fov-a.tif")"
+FB="$(upload "$BASE_DIR/samples/fov-b.tif")"
+FC="$(upload "$BASE_DIR/samples/fov-bright.tif")"
+FD="$(upload "$BASE_DIR/samples/fov-other.tif")"
+FE="$(upload "$BASE_DIR/samples/fov-lzw.tif")"
+
+cmp_state() {  # $1 A file_id $2 B file_id -> 打印结论 JSON 并输出 state
+  curl -s -X POST "$BASE/api/comparisons" -H 'Content-Type: application/json' \
+    -d "{\"file_a_id\":\"$1\",\"file_b_id\":\"$2\"}" | tee "$BASE_DIR/cmp.json" \
+    | "$PY" -c 'import sys,json;d=json.load(sys.stdin);print(d["state"])'
+}
+
+s1="$(cmp_state "$FA" "$FB")"
+CMP="$BASE_DIR/cmp.json"
+"$PY" -c 'import json;d=json.load(open("'"$CMP"'"));assert d["state"]=="same_fov",d;
+print("  最佳位移",d["best_shift"],"相似度",round(d["similarity"],4),
+      "重叠",d["overlap"]["width"],"x",d["overlap"]["height"])'
+[ "$s1" = "same_fov" ] && ok "平移（dy=5,dx=-6）的两件影像判同视野，并给出最佳位移与重叠范围"
+
+s2="$(cmp_state "$FA" "$FC")"
+[ "$s2" = "same_fov" ] && ok "整体亮度变化（gain=0.6,offset=60）下 NCC 仍判同视野"
+
+s3="$(cmp_state "$FA" "$FD")"
+[ "$s3" = "different_fov" ] && ok "无关纹理判不同视野，未误报"
+
+s4="$(cmp_state "$FA" "$FE")"
+"$PY" -c 'import json;d=json.load(open("'"$CMP"'"));assert d["state"]=="undetermined";assert "压缩" in d["unsupported"]["b"][0]'
+[ "$s4" = "undetermined" ] && ok "不支持的压缩影像判无法判定，并返回中文原因"
+
+# 4.5 比对期间轮换课题密钥：比对只读内存明文，轮换照常完成且结论正确
+curl -s -X POST "$BASE/api/rotations" >/dev/null
+( cmp_state "$FA" "$FB" >"$BASE_DIR/cmp-rotate.txt" ) &
+CP=$!
+wait "$CP"
+wait_rotation_done
+[ "$(cat "$BASE_DIR/cmp-rotate.txt")" = "same_fov" ] \
+  && ok "比对进行中课题密钥轮换照常完成，本次比对仍正确判同视野"
+ok "比对历史（结论绑定两件原件 SHA-256）："
+curl -s "$BASE/api/comparisons" | "$PY" -c 'import sys,json
+for d in json.load(sys.stdin):
+    print("  -",d["state"],d["file_a"]["filename"],"vs",d["file_b"]["filename"],
+          "sim=",d["similarity"])'
 
 say "演示完成"
 echo "浏览器入口: $RESTART_BASE/ （本脚本结束后服务已停止；手动启动见 README）"

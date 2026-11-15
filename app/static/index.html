@@ -61,6 +61,21 @@
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .small { font-size: 11.5px; color: var(--muted); }
   .truncate { max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  select { background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 7px; padding: 7px 10px; font-size: 13px; max-width: 320px; }
+  .b-same_fov { background: rgba(63,185,80,.15); color: var(--green); }
+  .b-different_fov { background: rgba(248,81,73,.15); color: var(--red); }
+  .b-undetermined { background: rgba(210,153,34,.16); color: var(--amber); }
+  .result-card { border: 1px solid var(--line); border-radius: 10px; background: var(--panel2);
+    padding: 14px 16px; margin-top: 12px; }
+  .result-card .verdict { font-size: 16px; font-weight: 700; }
+  .result-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 12px 0; }
+  .metric { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; }
+  .metric .mk { color: var(--muted); font-size: 11.5px; }
+  .metric .mv { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 14px; margin-top: 2px; }
+  .reasons { margin: 8px 0 0; padding-left: 18px; }
+  .reasons li { margin: 3px 0; }
+  .cand { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; color: var(--muted); }
 </style>
 </head>
 <body>
@@ -136,9 +151,29 @@
       <tbody id="uploads-body"></tbody></table>
   </section>
 
+  <!-- 同视野比对 -->
+  <section class="panel full">
+    <h2>④ 同视野比对 <span class="hint">两件影像在内存解密后比对：64～512 像素单页 8 位灰度、尺寸相同；容忍亮度变化与水平/垂直各 ≤8px 平移</span></h2>
+    <div class="row">
+      <label class="small">影像 A
+        <select id="cmp-a"></select>
+      </label>
+      <label class="small">影像 B
+        <select id="cmp-b"></select>
+      </label>
+      <button id="btn-compare">比对同视野</button>
+      <span class="small" id="cmp-hint">明文与数据密钥只在内存中使用，不落盘；比对期间可正常轮换课题密钥</span>
+    </div>
+    <div id="cmp-result"></div>
+    <h2 style="margin-top:16px">比对历史（结论绑定本次读取原件的 SHA-256）</h2>
+    <table><thead><tr><th>comparison_id</th><th>影像 A</th><th>影像 B</th><th>结论</th><th>最佳位移</th>
+      <th>相似度</th><th>重叠范围</th><th>时间</th></tr></thead>
+      <tbody id="comparisons-body"></tbody></table>
+  </section>
+
   <!-- 文件列表 / 下载 -->
   <section class="panel full">
-    <h2>④ 已归档影像与下载 <span class="hint">受理即快照 KEK/封装DEK，轮换重封装后在途下载仍可读完</span></h2>
+    <h2>⑤ 已归档影像与下载 <span class="hint">受理即快照 KEK/封装DEK，轮换重封装后在途下载仍可读完</span></h2>
     <table><thead><tr><th>file_id</th><th>文件名</th><th>大小</th><th>封装密钥</th><th>SHA-256</th><th>归档时间</th><th></th></tr></thead>
       <tbody id="files-body"></tbody></table>
     <h2 style="margin-top:16px">下载会话</h2>
@@ -204,6 +239,50 @@ async function startDownload(fileId, name) {
 async function abortDownload(id) { await api('POST', `/api/downloads/${id}/abort`); log('已中止下载会话 ' + id.slice(0,8), ''); refresh(); }
 async function abortUpload(id) { await api('POST', `/api/uploads/${id}/abort`); log('已中止上传会话 ' + id.slice(0,8), ''); refresh(); }
 
+// ---------- 同视野比对 ----------
+const STATE_LABEL = { same_fov: '同视野', different_fov: '不同视野', undetermined: '无法判定' };
+$('btn-compare').onclick = async () => {
+  const a = $('cmp-a').value, b = $('cmp-b').value;
+  if (!a || !b) return log('请先选择两件已归档影像', 'err');
+  if (a === b) return log('请选择两件不同的影像', 'err');
+  $('btn-compare').disabled = true;
+  try {
+    log('开始同视野比对：内存解密两件原件并搜索 ±8px 位移…', 'info');
+    const r = await api('POST', '/api/comparisons', { file_a_id: a, file_b_id: b });
+    renderCompareResult(r);
+    log(`比对完成：${STATE_LABEL[r.state]}（相似度=${r.similarity === null ? '—' : r.similarity.toFixed(4)}）`,
+      r.state === 'same_fov' ? 'ok' : r.state === 'different_fov' ? 'err' : '');
+    await refresh();
+  } catch (e) { log('比对失败：' + e.message, 'err'); }
+  finally { $('btn-compare').disabled = false; }
+};
+
+function renderCompareResult(r) {
+  const shift = r.best_shift ? `dy=${r.best_shift.dy}, dx=${r.best_shift.dx}` : '—';
+  const ov = r.overlap ? `${r.overlap.a.rows[0]}:${r.overlap.a.rows[1]} 行 / ${r.overlap.a.cols[0]}:${r.overlap.a.cols[1]} 列（${r.overlap.width}×${r.overlap.height} px）` : '—';
+  const dims = r.dimensions ? r.dimensions.join('×') + ' px' : '—';
+  const tex = r.texture ? `纹理占比 A ${(r.texture.a_ratio*100).toFixed(1)}% / B ${(r.texture.b_ratio*100).toFixed(1)}%` : '—';
+  const cands = (r.candidates || []).map(c => `(${c.dy},${c.dx})=${c.ncc.toFixed(4)}`).join('　');
+  const reasons = (r.reasons || []).map(x => `<li>${esc(x)}</li>`).join('');
+  $('cmp-result').innerHTML = `
+    <div class="result-card">
+      <div class="row">
+        <span class="verdict">结论：<span class="badge b-${r.state}">${STATE_LABEL[r.state]}</span></span>
+        <span class="small">影像 A：${esc(r.files.a.filename)}（${short(r.files.a.sha256,16)}）｜ 影像 B：${esc(r.files.b.filename)}（${short(r.files.b.sha256,16)}）</span>
+      </div>
+      <div class="result-grid">
+        <div class="metric"><div class="mk">尺寸（宽×高）</div><div class="mv">${dims}</div></div>
+        <div class="metric"><div class="mk">最佳位移（dy,dx）</div><div class="mv">${shift}</div></div>
+        <div class="metric"><div class="mk">相似度 NCC</div><div class="mv">${r.similarity === null ? '—' : r.similarity.toFixed(4)}</div></div>
+        <div class="metric"><div class="mk">与次优位移差</div><div class="mv">${r.ambiguity_margin === null ? '—' : r.ambiguity_margin.toFixed(4)}</div></div>
+        <div class="metric" style="grid-column:1 / -1"><div class="mk">最佳位移下的重叠范围（A 的行列切片，半开区间）· 尺寸</div><div class="mv">${ov}</div></div>
+        <div class="metric" style="grid-column:1 / -1"><div class="mk">纹理充分性</div><div class="mv">${tex}</div></div>
+      </div>
+      <ul class="reasons">${reasons || '<li>—</li>'}</ul>
+      <div class="cand" style="margin-top:6px">位移得分前 5：${cands || '—'}</div>
+    </div>`;
+}
+
 // ---------- 轮换 ----------
 $('btn-rotate').onclick = async () => {
   try { await api('POST', '/api/rotations'); log('已发起课题密钥轮换', 'info'); await refresh(); }
@@ -219,10 +298,11 @@ async function setGate(name, paused) {
 // ---------- 轮询渲染 ----------
 async function refresh() {
   try {
-    const [cfg, status, keys, files, uploads, downloads] = await Promise.all([
+    const [cfg, status, keys, files, uploads, downloads, comparisons] = await Promise.all([
       api('GET','/api/config'), api('GET','/api/rotations/current'),
       api('GET','/api/keys'), api('GET','/api/files'),
       api('GET','/api/uploads'), api('GET','/api/downloads'),
+      api('GET','/api/comparisons'),
     ]);
     $('health').textContent = '服务在线 · 上限 ' + cfg.max_file_size_mib + ' MiB/件';
     $('upload-hint').textContent = `单文件上限 ${cfg.max_file_size_mib} MiB`;
@@ -255,6 +335,26 @@ async function refresh() {
        <td class="mono small">${short(f.sha256,18)}</td><td class="small">${esc(f.created_at)}</td>
        <td><button onclick="startDownload('${f.file_id}','${esc(f.filename)}')">下载</button></td></tr>`
     ).join('') || '<tr><td colspan="7" class="small">暂无归档影像</td></tr>';
+
+    // 比对下拉框：保留当前选择
+    const selA = $('cmp-a').value, selB = $('cmp-b').value;
+    const opts = files.map(f => `<option value="${f.file_id}">${esc(f.filename)}（${short(f.file_id,10)}）</option>`).join('');
+    $('cmp-a').innerHTML = '<option value="">— 选择影像 A —</option>' + opts;
+    $('cmp-b').innerHTML = '<option value="">— 选择影像 B —</option>' + opts;
+    $('cmp-a').value = selA; $('cmp-b').value = selB;
+
+    $('comparisons-body').innerHTML = comparisons.map(c => {
+      const shift = (c.shift_dy === null || c.shift_dy === undefined) ? '—' : `(${c.shift_dy}, ${c.shift_dx})`;
+      const ov = c.overlap_width ? `${c.overlap_width}×${c.overlap_height} px` : '—';
+      return `<tr><td class="mono">${short(c.comparison_id)}</td>
+        <td class="truncate" title="${esc(c.file_a.filename)}">${esc(c.file_a.filename)}<div class="small mono">${short(c.file_a.sha256,14)}</div></td>
+        <td class="truncate" title="${esc(c.file_b.filename)}">${esc(c.file_b.filename)}<div class="small mono">${short(c.file_b.sha256,14)}</div></td>
+        <td><span class="badge b-${c.state}">${STATE_LABEL[c.state]}</span></td>
+        <td class="mono">${shift}</td>
+        <td class="mono">${c.similarity === null ? '—' : Number(c.similarity).toFixed(4)}</td>
+        <td class="small">${ov}</td>
+        <td class="small">${esc(c.created_at)}</td></tr>`;
+    }).join('') || '<tr><td colspan="8" class="small">暂无比对记录</td></tr>';
 
     $('uploads-body').innerHTML = uploads.map(u =>
       `<tr><td class="mono">${short(u.upload_id)}</td><td class="truncate">${esc(u.filename)}</td>

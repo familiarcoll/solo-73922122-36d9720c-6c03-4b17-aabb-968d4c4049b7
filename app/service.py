@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import os
 import sqlite3
 import threading
@@ -16,7 +17,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from . import crypto
+from . import crypto, imaging
 from .db import connect
 
 MAX_FILE_SIZE = 8 * 1024 * 1024  # 每件不超过 8 MiB
@@ -555,6 +556,138 @@ class Service:
             )
             self.conn.commit()
             return {"download_id": download_id, "state": "aborted"}
+
+    # ------------------------------------------------------------------ #
+    # 同视野比对：锁内解密到内存，锁外做图像比对（轮换可并行推进）
+    # ------------------------------------------------------------------ #
+    def _decrypt_to_memory_locked(self, f: sqlite3.Row) -> dict[str, bytes | str]:
+        """用文件行当前的 KEK/封装 DEK 在内存中解封并解密原件。
+
+        明文字节与 DEK 只存在于返回值（调用栈内存），不写任何临时文件。
+        """
+        kek_row = self._row(
+            "SELECT * FROM project_keys WHERE id=?", (f["current_kek_id"],)
+        )
+        if kek_row is None:
+            raise ServiceError("课题密钥记录缺失，无法解封", 500)
+        if not os.path.exists(self._kek_path(kek_row["key_id"])):
+            raise ServiceError("课题密钥文件已删除，无法解封该影像", 500)
+        kek = self._get_kek(kek_row["id"])
+        dek = crypto.unwrap_dek(kek, f["dek_nonce"], f["wrapped_dek"])
+        with open(f["blob_path"], "rb") as bf:
+            blob = bf.read()
+        nonce, ciphertext = blob[: crypto.NONCE_SIZE], blob[crypto.NONCE_SIZE:]
+        plaintext = crypto.decrypt_blob(dek, nonce, ciphertext)
+        if hashlib.sha256(plaintext).hexdigest() != f["sha256"]:
+            raise ServiceError(f"影像 {f['filename']} 解密后摘要校验失败，原件可能已损坏", 500)
+        return {"plaintext": plaintext, "sha256": f["sha256"]}
+
+    def compare_files(self, file_a_id: str, file_b_id: str) -> dict[str, Any]:
+        if file_a_id == file_b_id:
+            raise ServiceError("请选择两件不同的影像进行比对", 422)
+
+        # 1) 锁内：读取行、解封 DEK 并在内存解密两件原件。
+        #    解密完成即释放锁；即使随后轮换删除旧 KEK 文件，也不影响本次比对，
+        #    因为结论只依赖内存中的这两份明文（与磁盘/密钥状态解耦）。
+        with self.lock:
+            row_a = self._row("SELECT * FROM files WHERE file_id=?", (file_a_id,))
+            if row_a is None:
+                raise ServiceError("影像 A 不存在", 404)
+            row_b = self._row("SELECT * FROM files WHERE file_id=?", (file_b_id,))
+            if row_b is None:
+                raise ServiceError("影像 B 不存在", 404)
+            dec_a = self._decrypt_to_memory_locked(row_a)
+            dec_b = self._decrypt_to_memory_locked(row_b)
+            snapshot = {
+                "a": {"db_id": row_a["id"], "file_id": row_a["file_id"],
+                      "filename": row_a["filename"], "sha256": dec_a["sha256"]},
+                "b": {"db_id": row_b["id"], "file_id": row_b["file_id"],
+                      "filename": row_b["filename"], "sha256": dec_b["sha256"]},
+            }
+            plain_a, plain_b = dec_a["plaintext"], dec_b["plaintext"]
+
+        # 2) 锁外：TIFF 解码与 NCC 位移搜索（CPU 密集，不阻塞上传/下载/轮换）。
+        result = imaging.compare_tiff(plain_a, plain_b)
+
+        # 3) 锁内：固化比对记录（仅元数据与结论，不含任何明文/密钥材料）。
+        with self.lock:
+            # 复查行仍存在且 sha256 未变，确保结论对应本次读取的两件原件。
+            cur_a = self._row("SELECT sha256 FROM files WHERE id=?", (snapshot["a"]["db_id"],))
+            cur_b = self._row("SELECT sha256 FROM files WHERE id=?", (snapshot["b"]["db_id"],))
+            if cur_a is None or cur_b is None:
+                raise ServiceError("比对期间影像被删除，结论作废，请重新比对", 409)
+            if cur_a["sha256"] != snapshot["a"]["sha256"] or cur_b["sha256"] != snapshot["b"]["sha256"]:
+                raise ServiceError("比对期间原件发生变化，结论作废，请重新比对", 409)
+
+            comparison_id = uuid.uuid4().hex
+            best = result.get("best_shift")
+            overlap = result.get("overlap")
+            now = self._now()
+            self.conn.execute(
+                "INSERT INTO comparisons (comparison_id, file_a_id, file_b_id, "
+                "file_a_sha256, file_b_sha256, state, similarity, shift_dy, shift_dx, "
+                "overlap_width, overlap_height, detail, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    comparison_id,
+                    snapshot["a"]["db_id"], snapshot["b"]["db_id"],
+                    snapshot["a"]["sha256"], snapshot["b"]["sha256"],
+                    result["state"], result.get("similarity"),
+                    best["dy"] if best else None, best["dx"] if best else None,
+                    overlap["width"] if overlap else None,
+                    overlap["height"] if overlap else None,
+                    json.dumps(result, ensure_ascii=False),
+                    now,
+                ),
+            )
+            self.conn.commit()
+
+        return {
+            "comparison_id": comparison_id,
+            "state": result["state"],
+            "reasons": result["reasons"],
+            "unsupported": result["unsupported"],
+            "files": snapshot,
+            "dimensions": result.get("dimensions"),
+            "dimensions_b": result.get("dimensions_b"),
+            "best_shift": result.get("best_shift"),
+            "second_best_shift": result.get("second_best_shift"),
+            "overlap": result.get("overlap"),
+            "similarity": result.get("similarity"),
+            "ambiguity_margin": result.get("ambiguity_margin"),
+            "texture": result.get("texture"),
+            "candidates": result.get("candidates", []),
+            "created_at": now,
+        }
+
+    def list_comparisons(self) -> list[dict[str, Any]]:
+        with self.lock:
+            rows = self._all(
+                "SELECT c.*, fa.file_id AS a_file_id, fa.filename AS a_filename, "
+                "fb.file_id AS b_file_id, fb.filename AS b_filename "
+                "FROM comparisons c "
+                "JOIN files fa ON fa.id=c.file_a_id "
+                "JOIN files fb ON fb.id=c.file_b_id "
+                "ORDER BY c.id DESC"
+            )
+            return [
+                {
+                    "comparison_id": r["comparison_id"],
+                    "state": r["state"],
+                    "similarity": r["similarity"],
+                    "shift_dy": r["shift_dy"],
+                    "shift_dx": r["shift_dx"],
+                    "overlap_width": r["overlap_width"],
+                    "overlap_height": r["overlap_height"],
+                    "file_a": {"file_id": r["a_file_id"], "filename": r["a_filename"],
+                               "sha256": r["file_a_sha256"]},
+                    "file_b": {"file_id": r["b_file_id"], "filename": r["b_filename"],
+                               "sha256": r["file_b_sha256"]},
+                    "detail": json.loads(r["detail"]),
+                    "created_at": r["created_at"],
+                }
+                for r in rows
+            ]
 
     # ------------------------------------------------------------------ #
     # 密钥轮换：同期只允许一个；只重封装 DEK，不改原件密文

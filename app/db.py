@@ -71,6 +71,27 @@ CREATE TABLE IF NOT EXISTS downloads (
     updated_at   TEXT NOT NULL
 );
 
+-- 同视野比对：记录两件原件的身份快照（file_id + sha256）、结论与指标。
+-- 比对全程在内存完成，本表不保存任何明文字节、DEK 或 KEK 材料；
+-- 记录中的 sha256 用于核对“结论对应本次读取的两件原件”。
+CREATE TABLE IF NOT EXISTS comparisons (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    comparison_id  TEXT UNIQUE NOT NULL,
+    file_a_id      INTEGER NOT NULL REFERENCES files(id),
+    file_b_id      INTEGER NOT NULL REFERENCES files(id),
+    file_a_sha256  TEXT NOT NULL,
+    file_b_sha256  TEXT NOT NULL,
+    state          TEXT NOT NULL CHECK (state IN (
+                     'same_fov', 'different_fov', 'undetermined')),
+    similarity     REAL,
+    shift_dy       INTEGER,
+    shift_dx       INTEGER,
+    overlap_width  INTEGER,
+    overlap_height INTEGER,
+    detail         TEXT NOT NULL,
+    created_at     TEXT NOT NULL
+);
+
 -- 密钥轮换：running（重封装中）-> completing（等待在途会话收尾）-> completed。
 CREATE TABLE IF NOT EXISTS rotations (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,

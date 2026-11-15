@@ -122,6 +122,22 @@ def list_downloads() -> list[dict[str, Any]]:
     return svc().list_downloads()
 
 
+# --------------------------- 同视野比对（解密仅在内存） --------------------------- #
+class CompareBody(BaseModel):
+    file_a_id: str = Field(..., min_length=1, max_length=64)
+    file_b_id: str = Field(..., min_length=1, max_length=64)
+
+
+@app.post("/api/comparisons", status_code=201)
+def create_comparison(body: CompareBody) -> dict[str, Any]:
+    return svc().compare_files(body.file_a_id, body.file_b_id)
+
+
+@app.get("/api/comparisons")
+def list_comparisons() -> list[dict[str, Any]]:
+    return svc().list_comparisons()
+
+
 # --------------------------- 文件与课题密钥 --------------------------- #
 @app.get("/api/files")
 def list_files() -> list[dict[str, Any]]:
